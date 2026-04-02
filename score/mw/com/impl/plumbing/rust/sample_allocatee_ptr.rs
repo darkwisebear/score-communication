@@ -17,7 +17,15 @@
 use core::fmt::Debug;
 use std::mem::ManuallyDrop;
 
-use common_rs::{BlankBinding, CxxOptional, ProxyEventDataControlLocalView, SkeletonEventDataControlLocalView, SlotIndexType};
+use common_rs::{
+    BlankBinding,
+    CxxOptional,
+    ProxyEventDataControlLocalView,
+    SkeletonEventDataControlLocalView,
+    SlotIndexType,
+    UniquePtr,
+    CustomDeleter
+};
 
 #[repr(C)]
 struct EventDataControlComposite {
@@ -34,10 +42,7 @@ struct LolaSampleAllocateePtrBinding<T> {
     _event_data_control: CxxOptional<EventDataControlComposite<>>,
 }
 
-#[repr(C)]
-struct UniquePtrBinding<T> {
-    _ptr: *mut T,
-}
+type UniquePtrBinding<T> = UniquePtr<T, CustomDeleter>;
 
 #[repr(C)]
 union UniquePtrVariant<T> {
