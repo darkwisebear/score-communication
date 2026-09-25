@@ -2,13 +2,18 @@
 
 ## Context / findings
 
-- `score_com_concept::Runtime` (in `concept.rs`) is the root trait of the Rust COM API. Its
-  associated types are **generic associated types (GATs)**:
-  `ServiceDiscovery<I: Interface + Send>`, `Subscriber<T: CommData + Debug>`,
-  `ProducerBuilder<I: Interface>`, `Publisher<T: CommData + Debug>`, plus the plain
-  (non-generic) `ProviderInfo` and `ConsumerInfo`.
-- **mockall 0.14.0** is already vendored (`@score_communication_crate_index//:mockall`) and used
-  in this repo (`com-api-runtime-lola`, `com-api-ffi-lola/bridge_ffi_mock.rs`). Verified against
+- `score_com_concept::Runtime` (in `score/mw/com/rust/score_com_concept/concept.rs`, lines 89–140)
+  is the root trait of the Rust COM API. Its associated types are **generic associated types
+  (GATs)**, each additionally bounded to a concept trait (verified in source):
+  `ServiceDiscovery<I: Interface + Send>: ServiceDiscovery<I, Self>`,
+  `Subscriber<T: CommData + Debug>: Subscriber<T, Self>`,
+  `ProducerBuilder<I: Interface>: ProducerBuilder<I, Self>`,
+  `Publisher<T: CommData + Debug>: Publisher<T, Self>`, plus the plain (non-generic)
+  `ProviderInfo: ProviderInfo + Send + Clone` and `ConsumerInfo: Send + Clone`.
+- **mockall 0.14.0** is already vendored (`@score_communication_crate_index//:mockall`, via
+  `score_crates 0.0.11` in `MODULE.bazel`) and used in this repo
+  (`com-api-runtime-lola/BUILD`, `com-api-ffi-lola/BUILD` target `bridge_ffi_mock`, and the
+  `com-api-runtime-mockall` blueprint). Verified against
   mockall's docs/source and this repo's own precedent:
   - `#[automock]` / `mock!` **cannot** handle GAT associated types (`type Foo<'a>`, `type
     Foo<I>`) — confirmed limitation, no workaround exists in 0.14.
@@ -24,9 +29,21 @@
 - There is an **existing, incomplete stub crate**
   `score/mw/com/impl/rust/com-api/com-api-runtime-mock` (hand-rolled, full of `todo!()`, its
   `#[cfg(test)] mod test` doesn't even match current `SampleContainer`/`Subscriber` signatures,
-  not wired to any `rust_test` target). It's referenced from `score/mw/com/rust/score_com_mock.rs`
+  not wired to any `rust_test` target, and its `rust_library` is **not** `testonly`). It's
+  referenced from `score/mw/com/rust/score_com_mock.rs` (a `testonly` shim, crate_name `score_com`)
   with the comment *"Mock Runtime is not yet ready — eclipse-score/communication#490"*. This
   confirms the upstream feature request this work closes.
+- **Important: a partial Plan B blueprint already exists.** Commit `4f339524` ("Add blueprint for
+  mocking of a trait with GATs") added
+  `score/mw/com/impl/rust/com-api/com-api-runtime-mockall/` with `BUILD` (`testonly = True`,
+  crate_name `com_api_runtime_mockall`), `lib.rs`, `provider_info.rs`, `publisher.rs`,
+  `registry.rs`, `runtime.rs`, and `stubs.rs`. It already wires `@score_communication_crate_index//:mockall`
+  and a `com-api-runtime-mockall-tests` `rust_test`. **However**, `lib.rs` is currently **deleted in
+  the worktree** (`git status` shows `D .../com-api-runtime-mockall/lib.rs`), so the crate does not
+  build as-is — `BUILD` still lists `lib.rs` among `srcs`. Plan B must build on / reconcile with
+  this blueprint (restore `lib.rs` or rewrite it) rather than assume an empty crate. Its existing
+  files (`publisher.rs` GAT-wrapper workaround, `registry.rs`, `stubs.rs`) are a starting point, not
+  a finished implementation.
 - Per user decision, we build **two independent crates**, each a full answer to "make `Runtime`
   mockable with mockall", but with different behavioral philosophy:
   - **Plan A — Functional fake backend**: a working in-memory pub/sub simulation (samples
@@ -63,28 +80,73 @@
 
 ## Common groundwork (both plans)
 
-1. Confirm crate layout convention: new crates under
-   `score/mw/com/impl/rust/com-api/<name>/{BUILD,*.rs}`, `rust_library`, `testonly = True`,
-   visibility `//score/mw/com:__subpackages__` (matches `com-api-runtime-mock` /
-   `bridge_ffi_mock`).
-2. Add `@score_communication_crate_index//:mockall` as a dep where mockall is actually used.
-3. No changes to `score_com_concept::concept.rs` are required — mocking happens entirely in the
-   new downstream crates, so the core trait-definition crate stays free of test-only
-   dependencies/attributes.
-4. Each plan gets its own re-export shim analogous to `score_com_mock.rs`
-   (e.g. `score/mw/com/rust/score_com_fake.rs` re-exporting Plan A's `FakeRuntimeImpl`, and
-   `score/mw/com/rust/score_com_mockall.rs` re-exporting Plan B's `MockRuntimeImpl`), each with
-   its own `testonly` `rust_library` target in `score/mw/com/rust/BUILD`, so downstream users can
-   pick exactly one without pulling in the other's dependencies.
-5. Both plans need an example/integration test that "resembles"
-   `stream_and_send_using_multi_thread` from `tests_using_tokio_runtime.rs`, reusing
-   `com_api_gen::{Tire, VehicleInterface, VehicleOfferedProducer}` and the same overall
-   producer/consumer-over-tokio-tasks shape, adapted to each backend's semantics. New files:
+> **Verified against the repo** (branch `add-mockall-mock-runtime`, 2026-09-25). Status per step:
+> ✅ confirmed as written · ⚠️ confirmed with correction · ➕ new prerequisite discovered.
+
+1. ⚠️ **Crate layout convention** — confirmed, with one correction. New crates go under
+   `score/mw/com/impl/rust/com-api/<name>/{BUILD,*.rs}` as `rust_library` with visibility
+   `//score/mw/com:__subpackages__`. The `testonly = True` attribute is **not** a shared convention
+   of that directory: the legacy `com-api-runtime-mock` crate is *not* `testonly`, and neither is
+   `bridge_ffi_mock` (both are plain `rust_library` targets in their BUILD files). `testonly = True`
+   *is* correct for the two new mock crates (they are test-only by purpose — the existing
+   `com-api-runtime-mockall` blueprint already sets it) — keep it, but don't cite the other two
+   targets as the precedent for it.
+2. ✅ **mockall dependency** — confirmed. The label is
+   `@score_communication_crate_index//:mockall` (repo name for `score_crates 0.0.11` in
+   `MODULE.bazel`, providing `mockall 0.14.0`). Already used in `com-api-runtime-lola/BUILD`,
+   `com-api-ffi-lola/BUILD` (`bridge_ffi_mock`), and the `com-api-runtime-mockall` blueprint `BUILD`.
+   Plan A (pure hand-written fake) needs **no** mockall dep; only Plan B does.
+3. ✅ **No `concept.rs` changes needed** — confirmed. `score_com_concept`'s `rust_library`
+   (`score/mw/com/rust/score_com_concept/BUILD`) depends only on `paste`, `futures`, `thiserror`,
+   baselibs — no mockall/test-only deps — so keeping mocking in downstream crates leaves it clean.
+4. ✅ **Re-export shims** — pattern confirmed, current state documented. The existing
+   `score/mw/com/rust/score_com_mock.rs` target (`name = "score_com_mock"`, `testonly = True`,
+   `crate_name = "score_com"`, visibility `//visibility:public`) does `pub use score_com::*;` plus
+   re-exports of the (legacy) `MockRuntimeImpl`/`MockRuntimeBuilderImpl` — i.e. it is a *fork* of the
+   `score_com` crate, not just an add-on. The two new shims should follow this shape:
+   `score/mw/com/rust/score_com_fake.rs` (Plan A) and `score/mw/com/rust/score_com_mockall.rs`
+   (Plan B), each with its own `testonly` `rust_library` target in `score/mw/com/rust/BUILD`. Note
+   `score_com_mock` currently points at the broken legacy stub — see open follow-ups.
+5. ⚠️ **Example/integration tests** — reference test confirmed, with details.
+   `stream_and_send_using_multi_thread` lives at line 283 of
+   `score/mw/com/example/com-api-example/tests_using_tokio_runtime.rs` (320 lines, single
+   `#[cfg(test)] mod test`). Facts relevant to reusing it:
+   - The test is `#[tokio::test(flavor = "multi_thread")]`; the runtime is a
+     `OnceLock<score_com::LolaRuntimeImpl>` singleton (`get_test_runtime()`), and the Lola
+     target is tagged `manual` with `data = ["etc/mw_com_config.json"]` (config-dependent).
+   - It reuses `com_api_gen::{Tire, VehicleInterface, VehicleOfferedProducer}` and
+     `score_com::{...}` — both confirmed available (see item 6).
+   - Helper fns to adapt verbatim: `create_producer<R: Runtime>` (builds + offers a
+     `VehicleOfferedProducer<R>`), `create_consumer_async<R: Runtime>` (async discovery →
+     `VehicleConsumer<R>`), `async_data_sender_fn` (5 `Tire` samples, 1 s interval, via
+     `allocate()`/`write()`/`send()`), `stream_processor_fn` (`subscribed.to_stream()` +
+     `futures::stream::StreamExt::next()` with per-sample timeout).
+   - **Correction to the "not tagged `manual`" plan**: the new fake/mockall test targets should be
+     `rust_test` with `features = ["link_std_cpp_lib"]` (required — `com_api_gen` links the C++
+     `vehicle_gen_cpp` object; see the existing tokio target), and must **not** require the
+     `etc/mw_com_config.json` data file (which is why the Lola target is `manual`). Omitting the
+     data dep and the config path is what lets them run in normal CI; no `manual` tag.
+   New files (names confirmed available in the tree):
    - `score/mw/com/example/com-api-example/tests_using_fake_runtime.rs` (Plan A)
    - `score/mw/com/example/com-api-example/tests_using_mockall_runtime.rs` (Plan B)
-   Both wired as `rust_test` targets in `com-api-example/BUILD`, **not** tagged `manual` (no real
-   backend/config file needed), so they run in normal CI — unlike the existing Lola-backed
-   `com-api-example-tokio-integration-test`.
+6. ➕ **Example generator exports** (needed by step 5) — confirmed.
+   `com-api-gen/com_api_gen.rs` defines `Tire` (`pressure: f32`, derives `Debug, Reloc, CommData,
+   ScoreDebug`, `#[repr(C)]`, `#[comm_data(id = "Tire")]`), an empty `Exhaust` struct (auto
+   `CommData` id), and `interface!(interface Vehicle { Id = "VehicleInterface", left_tire:
+   Event<Tire>, exhaust: Event<Exhaust> })`. The crate (`com_api_gen`, `crate_name = "com_api_gen"`,
+   `features = ["link_std_cpp_lib"]`) therefore exports `VehicleInterface`, `VehicleConsumer<R>`,
+   `VehicleProducer<R>`, `VehicleOfferedProducer<R>` with the events as struct fields
+   (e.g. `consumer.left_tire`, a per-event `Subscriber`-typed field — exactly how the tokio test
+   uses `consumer.left_tire.subscribe(...)`).
+7. ➕ **Plan B worktree repair** (new, discovered during verification) — before any Plan B work,
+   resolve the deleted `lib.rs`: either restore `git show
+   HEAD:score/mw/com/impl/rust/com-api/com-api-runtime-mockall/lib.rs` (which declares
+   `provider_info/publisher/registry/runtime/stubs` and re-exports `ProviderInfoHandle`, the
+   `MockPublisherImpl`/`MockPublisherPolicy`/`MockSampleMaybeUninit`/`MockSampleMut`/`PublisherPolicy`
+   set, `MockConsumerInfo`/`MockRegistry`, and `MockRuntimeBuilderImpl`/`MockRuntimeImpl`) or rewrite
+   it to match the final file set. `BUILD` (`srcs` list, `crate_name = "com_api_runtime_mockall"`,
+   `com-api-runtime-mockall-tests` target) is already in place and needs to stay consistent with
+   whatever the final `srcs` are.
 
 ## Plan A — Functional fake backend (`com-api-runtime-fake`)
 
@@ -113,7 +175,33 @@ New crate `score/mw/com/impl/rust/com-api/com-api-runtime-fake`.
 
 ## Plan B — Classical mockall backend (`com-api-runtime-mockall`)
 
-New crate `score/mw/com/impl/rust/com-api/com-api-runtime-mockall`.
+Crate `score/mw/com/impl/rust/com-api/com-api-runtime-mockall` — **partially exists already**
+(blueprint from commit `4f339524`: `BUILD` with `testonly = True` + `crate_name =
+com_api_runtime_mockall` + `com-api-runtime-mockall-tests` `rust_test`; `lib.rs` [currently deleted
+in the worktree — see groundwork item 7], `provider_info.rs`, `publisher.rs`, `registry.rs`,
+`runtime.rs`, `stubs.rs`). Verified contents:
+- `provider_info.rs`: `ProviderInfoHandle` — a **plain** `#[derive(Clone, Debug)]` struct carrying
+  `instance: InstanceSpecifier` + the shared `MockRegistry`; `offer_service`/`stop_offer_service`
+  currently succeed unconditionally (scriptable offer behavior is explicitly marked out of scope
+  for that slice). Not `#[automock]`-backed, despite the per-trait table — Plan B must decide
+  whether to upgrade it.
+- `publisher.rs`: the GAT workaround — `PublisherPolicy<T>` (plain, lifetime-free trait),
+  `MockPublisherPolicy` (`#[automock]`), `MockSampleMaybeUninit<'a, T>` / `MockSampleMut<'a, T>`,
+  and `MockPublisherImpl<T>` holding `Arc<Mutex<MockPublisherPolicy<T>>>`; `new()` looks the policy
+  up in the registry and **panics** if none was registered.
+- `registry.rs`: `MockRegistry` = `Arc<Mutex<HashMap<SlotKey, Box<dyn Any + Send>>>>`
+  (type-erased per-slot storage) plus `MockConsumerInfo` (plain struct).
+- `runtime.rs`: `MockRuntimeImpl` (clones share the registry) with GAT slots bound to the
+  `Stub*` types for `ServiceDiscovery`/`Subscriber`/`ProducerBuilder`, `MockPublisherImpl<T>` for
+  `Publisher`, `ProviderInfoHandle`, and `MockConsumerInfo`; `MockRuntimeBuilderImpl` is an empty
+  struct.
+- `stubs.rs`: minimal non-mockable placeholders `StubSample`, `StubSubscriber`,
+  `StubSubscription`, `StubServiceDiscovery`, `StubConsumerBuilder`, `StubProducerBuilder`
+  covering the remaining GAT slots.
+
+Plan B therefore starts from this working partial crate, completes/replaces the stubs per the
+per-trait table above (and aligns `MockProviderInfo` handling with the table or amends the table),
+and keeps the existing BUILD targets intact.
 
 - `MockRuntimeImpl`: hand-written, GAT slots bound to:
   `MockServiceDiscoveryImpl<I>`, `MockSubscriberImpl<T>`, `MockProducerBuilderImpl<I>`,
@@ -142,12 +230,24 @@ New crate `score/mw/com/impl/rust/com-api/com-api-runtime-mockall`.
 
 ## Validation
 
+- **First**: repair the worktree so the existing blueprint builds again (groundwork item 7) —
+  `git checkout -- score/mw/com/impl/rust/com-api/com-api-runtime-mockall/lib.rs` (or rewrite it),
+  then `bazel build //score/mw/com/impl/rust/com-api/com-api-runtime-mockall/...` must pass
+  *before* Plan B changes land.
 - `bazel build //score/mw/com/impl/rust/com-api/com-api-runtime-fake/... //score/mw/com/impl/rust/com-api/com-api-runtime-mockall/...`
-- `bazel test //score/mw/com/example/com-api-example:com-api-example-fake-runtime-test //score/mw/com/example/com-api-example:com-api-example-mockall-runtime-test` (final target names TBD during implementation)
+- `bazel test //score/mw/com/impl/rust/com-api/com-api-runtime-mockall:com-api-runtime-mockall-tests`
+  (the blueprint's own crate-level unit test, already wired in its BUILD) plus the two new
+  example tests:
+  `bazel test //score/mw/com/example/com-api-example:com-api-example-fake-runtime-test //score/mw/com/example/com-api-example:com-api-example-mockall-runtime-test`
+  (final target names TBD during implementation).
 - Existing `score_com`/`score_com_concept`/`com-api-example` targets must remain green
-  (`bazel test //score/mw/com/...` for anything touched).
-- No changes expected to `concept.rs`, so its existing doctest/unit-test targets are unaffected
-  unless incidentally touched.
+  (`bazel test //score/mw/com/...` for anything touched). Note the Lola-backed
+  `com-api-example-tokio-integration-test` is tagged `manual` — it is not part of the default CI
+  set, so "remain green" means the non-manual subset plus a manual spot-check.
+- No changes expected to `concept.rs`, so its existing doctest/unit-test targets
+  (`score_com_concept-test`, `score_com_concept-macros-tests`,
+  `score_com_concept-macros-unit-tests` — all `manual`/scoped) are unaffected unless incidentally
+  touched.
 
 ## Open follow-ups (not blocking, revisit after both crates land)
 
@@ -155,4 +255,10 @@ New crate `score/mw/com/impl/rust/com-api/com-api-runtime-mockall`.
   Plan A).
 - Whether `score_com_mock` (existing test-only re-export) should be repointed at one of the two
   new crates, replaced by two new re-export targets, or left alone.
+- The Plan B blueprint has already drifted from this doc's "classical mockall" description
+  (registry-backed `MockPublisherImpl`, unconditional `offer_service`, `Stub*` placeholders).
+  Decide, per trait, whether to follow the blueprint's evolving approach or the per-trait table —
+  and reconcile the doc's table with the chosen approach.
+- Resolve the deleted `com-api-runtime-mockall/lib.rs` worktree state (restore from HEAD vs.
+  rewrite) as part of the first Plan B commit, so the branch builds.
 - Commit messages will include `Closes #490` per user instruction (eclipse-score/communication).
