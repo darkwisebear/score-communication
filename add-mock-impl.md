@@ -38,12 +38,14 @@
   `score/mw/com/impl/rust/com-api/com-api-runtime-mockall/` with `BUILD` (`testonly = True`,
   crate_name `com_api_runtime_mockall`), `lib.rs`, `provider_info.rs`, `publisher.rs`,
   `registry.rs`, `runtime.rs`, and `stubs.rs`. It already wires `@score_communication_crate_index//:mockall`
-  and a `com-api-runtime-mockall-tests` `rust_test`. **However**, `lib.rs` is currently **deleted in
-  the worktree** (`git status` shows `D .../com-api-runtime-mockall/lib.rs`), so the crate does not
-  build as-is — `BUILD` still lists `lib.rs` among `srcs`. Plan B must build on / reconcile with
-  this blueprint (restore `lib.rs` or rewrite it) rather than assume an empty crate. Its existing
-  files (`publisher.rs` GAT-wrapper workaround, `registry.rs`, `stubs.rs`) are a starting point, not
-  a finished implementation.
+  and a `com-api-runtime-mockall-tests` `rust_test`. **However**, `lib.rs` was later **deleted by
+  commit `577d7027`** (the current HEAD, "Updated add-mock-impl.md with the ground work done"), so
+  the crate does not build **at HEAD** — `BUILD` still lists `lib.rs` among `srcs`, and `git show
+  HEAD:.../com-api-runtime-mockall/lib.rs` fails because `HEAD` no longer contains the file (the
+  worktree itself is clean). Plan B must build on / reconcile with this blueprint (restore `lib.rs`
+  from `4f339524` or rewrite it) rather than assume an empty crate. Its existing files
+  (`publisher.rs` GAT-wrapper workaround, `registry.rs`, `stubs.rs`) are a starting point, not a
+  finished implementation.
 - Per user decision, we build **two independent crates**, each a full answer to "make `Runtime`
   mockable with mockall", but with different behavioral philosophy:
   - **Plan A — Functional fake backend**: a working in-memory pub/sub simulation (samples
@@ -80,14 +82,16 @@
 
 ## Common groundwork (both plans)
 
-> **Verified against the repo** (branch `add-mockall-mock-runtime`, 2026-09-25). Status per step:
+> **Verified against the repo** (branch `add-mockall-mock-runtime`, 2026-09-25; re-verified
+> 2026-09-28 against HEAD `577d7027`). Status per step:
 > ✅ confirmed as written · ⚠️ confirmed with correction · ➕ new prerequisite discovered.
 
 1. ⚠️ **Crate layout convention** — confirmed, with one correction. New crates go under
    `score/mw/com/impl/rust/com-api/<name>/{BUILD,*.rs}` as `rust_library` with visibility
    `//score/mw/com:__subpackages__`. The `testonly = True` attribute is **not** a shared convention
    of that directory: the legacy `com-api-runtime-mock` crate is *not* `testonly`, and neither is
-   `bridge_ffi_mock` (both are plain `rust_library` targets in their BUILD files). `testonly = True`
+   `bridge_ffi_mock` (`com-api-runtime-mock` is a plain `rust_library`; `bridge_ffi_mock` is a
+   plain `rust_binary` — both without `testonly`). `testonly = True`
    *is* correct for the two new mock crates (they are test-only by purpose — the existing
    `com-api-runtime-mockall` blueprint already sets it) — keep it, but don't cite the other two
    targets as the precedent for it.
@@ -138,9 +142,12 @@
    `VehicleProducer<R>`, `VehicleOfferedProducer<R>` with the events as struct fields
    (e.g. `consumer.left_tire`, a per-event `Subscriber`-typed field — exactly how the tokio test
    uses `consumer.left_tire.subscribe(...)`).
-7. ➕ **Plan B worktree repair** (new, discovered during verification) — before any Plan B work,
-   resolve the deleted `lib.rs`: either restore `git show
-   HEAD:score/mw/com/impl/rust/com-api/com-api-runtime-mockall/lib.rs` (which declares
+7. ➕ **Plan B repair of the committed `lib.rs` deletion** (new, discovered during verification) —
+   the deletion is **committed in `577d7027` (current HEAD)**, not a worktree artifact (the
+   worktree is clean; `git show HEAD:.../com-api-runtime-mockall/lib.rs` fails because the file no
+   longer exists in `HEAD`, so restore-from-`HEAD` is impossible). Before any Plan B work, restore
+   `lib.rs` from the only git-recoverable source, commit `4f339524`: `git show
+   4f339524:score/mw/com/impl/rust/com-api/com-api-runtime-mockall/lib.rs` (which declares
    `provider_info/publisher/registry/runtime/stubs` and re-exports `ProviderInfoHandle`, the
    `MockPublisherImpl`/`MockPublisherPolicy`/`MockSampleMaybeUninit`/`MockSampleMut`/`PublisherPolicy`
    set, `MockConsumerInfo`/`MockRegistry`, and `MockRuntimeBuilderImpl`/`MockRuntimeImpl`) or rewrite
@@ -177,8 +184,8 @@ New crate `score/mw/com/impl/rust/com-api/com-api-runtime-fake`.
 
 Crate `score/mw/com/impl/rust/com-api/com-api-runtime-mockall` — **partially exists already**
 (blueprint from commit `4f339524`: `BUILD` with `testonly = True` + `crate_name =
-com_api_runtime_mockall` + `com-api-runtime-mockall-tests` `rust_test`; `lib.rs` [currently deleted
-in the worktree — see groundwork item 7], `provider_info.rs`, `publisher.rs`, `registry.rs`,
+com_api_runtime_mockall` + `com-api-runtime-mockall-tests` `rust_test`; `lib.rs` [committed deletion
+in `577d7027` — see groundwork item 7], `provider_info.rs`, `publisher.rs`, `registry.rs`,
 `runtime.rs`, `stubs.rs`). Verified contents:
 - `provider_info.rs`: `ProviderInfoHandle` — a **plain** `#[derive(Clone, Debug)]` struct carrying
   `instance: InstanceSpecifier` + the shared `MockRegistry`; `offer_service`/`stop_offer_service`
@@ -199,8 +206,8 @@ in the worktree — see groundwork item 7], `provider_info.rs`, `publisher.rs`, 
   `StubSubscription`, `StubServiceDiscovery`, `StubConsumerBuilder`, `StubProducerBuilder`
   covering the remaining GAT slots.
 
-Plan B therefore starts from this working partial crate, completes/replaces the stubs per the
-per-trait table above (and aligns `MockProviderInfo` handling with the table or amends the table),
+Plan B therefore starts from this partial crate (after restoring its `lib.rs` per groundwork item
+7), completes/replaces the stubs per the per-trait table above (and aligns `MockProviderInfo` handling with the table or amends the table),
 and keeps the existing BUILD targets intact.
 
 - `MockRuntimeImpl`: hand-written, GAT slots bound to:
@@ -230,10 +237,13 @@ and keeps the existing BUILD targets intact.
 
 ## Validation
 
-- **First**: repair the worktree so the existing blueprint builds again (groundwork item 7) —
-  `git checkout -- score/mw/com/impl/rust/com-api/com-api-runtime-mockall/lib.rs` (or rewrite it),
-  then `bazel build //score/mw/com/impl/rust/com-api/com-api-runtime-mockall/...` must pass
-  *before* Plan B changes land.
+- **First**: restore `com-api-runtime-mockall/lib.rs` so the existing blueprint builds again
+  (groundwork item 7). `git checkout --`/restore-from-`HEAD` is **not** possible — the deletion is
+  committed (`577d7027`) and `HEAD` no longer contains the file — so use
+  `git show 4f339524:score/mw/com/impl/rust/com-api/com-api-runtime-mockall/lib.rs >
+  score/mw/com/impl/rust/com-api/com-api-runtime-mockall/lib.rs` (or rewrite it to match the final
+  file set). Then `bazel build //score/mw/com/impl/rust/com-api/com-api-runtime-mockall/...` must
+  pass *before* Plan B changes land.
 - `bazel build //score/mw/com/impl/rust/com-api/com-api-runtime-fake/... //score/mw/com/impl/rust/com-api/com-api-runtime-mockall/...`
 - `bazel test //score/mw/com/impl/rust/com-api/com-api-runtime-mockall:com-api-runtime-mockall-tests`
   (the blueprint's own crate-level unit test, already wired in its BUILD) plus the two new
@@ -259,6 +269,7 @@ and keeps the existing BUILD targets intact.
   (registry-backed `MockPublisherImpl`, unconditional `offer_service`, `Stub*` placeholders).
   Decide, per trait, whether to follow the blueprint's evolving approach or the per-trait table —
   and reconcile the doc's table with the chosen approach.
-- Resolve the deleted `com-api-runtime-mockall/lib.rs` worktree state (restore from HEAD vs.
-  rewrite) as part of the first Plan B commit, so the branch builds.
+- Restore the committed-deleted `com-api-runtime-mockall/lib.rs` (from `4f339524` vs. rewrite) as
+  part of the first Plan B commit, so the branch builds — `HEAD` no longer contains the file, so
+  restore-from-`HEAD` is not an option.
 - Commit messages will include `Closes #490` per user instruction (eclipse-score/communication).
