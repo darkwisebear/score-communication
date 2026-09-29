@@ -43,3 +43,19 @@ rust_library(
         "//score/mw/com/impl/rust/com-api/com-api-runtime-mock",
     ],
 )
+
+# Test-only re-export of the full COM API including the mockall (Plan B) runtime.
+# `crate_name` is mandatory: the interface! macro expands to absolute `score_com::…` paths.
+rust_library(
+    name = "score_com_mockall",
+    testonly = True,
+    srcs = ["score_com_mockall.rs"],
+    crate_name = "score_com",
+    visibility = [
+        "//visibility:public",
+    ],
+    deps = [
+        ":score_com",
+        "//score/mw/com/impl/rust/com-api/com-api-runtime-mockall",
+    ],
+)

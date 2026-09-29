@@ -62,3 +62,19 @@ rust_test(
         "@score_communication_crate_index//:tokio",
     ],
 )
+
+# Mirrors `com-api-example-tokio-integration-test` but runs against the
+# mockall (Plan B) runtime. Everything is scripted via `expect_*()`; no config
+# file or backend is needed, so it runs in normal CI (no `manual` tag).
+rust_test(
+    name = "com-api-example-mockall-runtime-test",
+    srcs = ["tests_using_mockall_runtime.rs"],
+    features = ["link_std_cpp_lib"],
+    deps = [
+        "//score/mw/com/example/com-api-example/com-api-gen",
+        "//score/mw/com/rust:score_com_mockall",
+        "@score_communication_crate_index//:futures",
+        "@score_communication_crate_index//:mockall",
+        "@score_communication_crate_index//:tokio",
+    ],
+)

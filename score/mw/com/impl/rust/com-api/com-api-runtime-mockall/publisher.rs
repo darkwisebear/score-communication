@@ -24,9 +24,9 @@
 //!   [`crate::MockRegistry`].
 
 use crate::provider_info::ProviderInfoHandle;
+use crate::registry::lookup;
 use crate::runtime::MockRuntimeImpl;
 use core::fmt::{self, Debug};
-use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use mockall::automock;
@@ -47,7 +47,7 @@ pub trait PublisherPolicy<T: CommData + Debug + 'static>: Send + 'static {
 pub struct MockSampleMaybeUninit<'a, T: CommData + Debug> {
     data: MaybeUninit<T>,
     policy: Arc<Mutex<MockPublisherPolicy<T>>>,
-    _lifetime: PhantomData<&'a ()>,
+    _lifetime: core::marker::PhantomData<&'a ()>,
 }
 
 impl<'a, T: CommData + Debug> AsMut<MaybeUninit<T>> for MockSampleMaybeUninit<'a, T> {
@@ -58,8 +58,7 @@ impl<'a, T: CommData + Debug> AsMut<MaybeUninit<T>> for MockSampleMaybeUninit<'a
 
 impl<'a, T: CommData + Debug> Debug for MockSampleMaybeUninit<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MockSampleMaybeUninit")
-            .finish_non_exhaustive()
+        f.debug_struct("MockSampleMaybeUninit").finish_non_exhaustive()
     }
 }
 
@@ -70,7 +69,7 @@ impl<'a, T: CommData + Debug> SampleMaybeUninit<T> for MockSampleMaybeUninit<'a,
         MockSampleMut {
             data: value,
             policy: self.policy,
-            _lifetime: PhantomData,
+            _lifetime: core::marker::PhantomData,
         }
     }
 
@@ -78,7 +77,7 @@ impl<'a, T: CommData + Debug> SampleMaybeUninit<T> for MockSampleMaybeUninit<'a,
         MockSampleMut {
             data: unsafe { self.data.assume_init() },
             policy: self.policy,
-            _lifetime: PhantomData,
+            _lifetime: core::marker::PhantomData,
         }
     }
 }
@@ -87,7 +86,7 @@ impl<'a, T: CommData + Debug> SampleMaybeUninit<T> for MockSampleMaybeUninit<'a,
 pub struct MockSampleMut<'a, T: CommData + Debug> {
     data: T,
     policy: Arc<Mutex<MockPublisherPolicy<T>>>,
-    _lifetime: PhantomData<&'a ()>,
+    _lifetime: core::marker::PhantomData<&'a ()>,
 }
 
 impl<'a, T: CommData + Debug> Deref for MockSampleMut<'a, T> {
@@ -106,9 +105,7 @@ impl<'a, T: CommData + Debug> DerefMut for MockSampleMut<'a, T> {
 
 impl<'a, T: CommData + Debug> Debug for MockSampleMut<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MockSampleMut")
-            .field("data", &self.data)
-            .finish()
+        f.debug_struct("MockSampleMut").field("data", &self.data).finish()
     }
 }
 
@@ -124,7 +121,8 @@ pub struct MockPublisherImpl<T: CommData + Debug> {
 }
 
 impl<T: CommData + Debug> MockPublisherImpl<T> {
-    /// Test-only constructor: skip the registry and wrap an already-scripted policy.
+    /// Test-only constructor: skip the registry and wrap an already-scripted
+    /// policy.
     pub fn from_policy(policy: MockPublisherPolicy<T>) -> Self {
         Self {
             policy: Arc::new(Mutex::new(policy)),
@@ -143,21 +141,21 @@ impl<T: CommData + Debug> Publisher<T, MockRuntimeImpl> for MockPublisherImpl<T>
         Ok(MockSampleMaybeUninit {
             data: MaybeUninit::uninit(),
             policy: Arc::clone(&self.policy),
-            _lifetime: PhantomData,
+            _lifetime: core::marker::PhantomData,
         })
     }
 
     fn new(identifier: &str, instance_info: ProviderInfoHandle) -> Result<Self> {
-        let policy = instance_info
-            .registry
-            .take_publisher::<T>(&instance_info.instance, identifier)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no MockPublisherPolicy registered for {}::{identifier}",
-                    instance_info.instance.as_ref()
-                )
-            });
-        Ok(Self::from_policy(policy))
+        let policy =
+            lookup::publisher::<T>(&instance_info.registry, &instance_info.instance, identifier)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no MockPublisherPolicy registered for instance '{}' event '{}'",
+                        instance_info.instance.as_ref(),
+                        identifier
+                    )
+                });
+        Ok(Self { policy })
     }
 }
 
@@ -167,7 +165,7 @@ mod test {
     use crate::registry::MockRegistry;
     use mockall::predicate::eq;
     use score_com_concept::{
-        AllocationFailureReason, Error, InstanceSpecifier, Publisher, SampleMaybeUninit, SampleMut,
+        AllocationFailureReason, Error, InstanceSpecifier, Publisher,
     };
 
     #[derive(Debug, Clone, PartialEq)]
@@ -183,7 +181,7 @@ mod test {
     }
 
     fn test_spec() -> InstanceSpecifier {
-        InstanceSpecifier::new("/Vehicle/Service1/Instance").expect("valid instance specifier")
+        InstanceSpecifier::new("/Test/Service1/Instance").expect("valid instance specifier")
     }
 
     #[test]
@@ -242,7 +240,11 @@ mod test {
         policy.expect_allocate().times(1).returning(|| Ok(()));
         registry.expect_publisher(&spec, "left_tire", policy);
 
-        let info = ProviderInfoHandle::new(spec, registry);
+        let info = ProviderInfoHandle::from_policy(
+            spec,
+            registry,
+            crate::provider_info::MockProviderInfoPolicy::new(),
+        );
         let publisher = MockPublisherImpl::<TestData>::new("left_tire", info)
             .expect("Publisher::new should take the registered policy");
         publisher.allocate().expect("scripted allocate");
@@ -250,10 +252,14 @@ mod test {
 
     #[test]
     #[should_panic(
-        expected = "no MockPublisherPolicy registered for /Vehicle/Service1/Instance::left_tire"
+        expected = "no MockPublisherPolicy registered for instance '/Test/Service1/Instance' event 'left_tire'"
     )]
     fn registry_miss_panics_with_context() {
-        let info = ProviderInfoHandle::new(test_spec(), MockRegistry::new());
+        let info = ProviderInfoHandle::from_policy(
+            test_spec(),
+            MockRegistry::new(),
+            crate::provider_info::MockProviderInfoPolicy::new(),
+        );
         let _ = MockPublisherImpl::<TestData>::new("left_tire", info);
     }
 }
