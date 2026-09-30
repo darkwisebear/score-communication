@@ -222,6 +222,107 @@ Two mockall limitations drive the design:
 
 The net result: a single `MockRuntimeImpl` + `expect_*` calls give you a fully controllable double of the runtime, with mockall's `times(n)`, `.with(predicate)`, and `returning(closure)` for asserting call counts, argument values, and injecting failures (e.g. making `allocate` return an `Error` to test error handling).
 
+## Fake Runtime for Testing (functional fake)
+
+Where the mockall runtime is a *scripted double* (nothing happens until a test says so), the **`com-api-runtime-fake`** crate is a **functional in-memory fake**: a `testonly`, hand-written implementation of `score_com_concept::Runtime` (no mockall) in which samples published by an offered producer are **actually delivered** to matching subscriptions. It is for exercising *business logic end-to-end* — producer, discovery, consumer, and the data flowing between them — without any IPC, config file, or expectation scripting.
+
+The core idea is **real, local, data-carrying**: `send` really appends to a shared per-event queue, `offer_service` really makes the instance discoverable, and `try_receive`/`to_stream` really read what was sent. Because it is a real implementation of the concepts, the *same* runtime-agnostic business code (including `interface!`-generated producers/consumers) runs against it unchanged.
+
+### Using the fake runtime
+
+Depend on the `score_com_fake` re-export target instead of `score_com`. It re-exports the full COM API *plus* the fake types and keeps the crate name `score_com` so that `interface!`-generated code (which expands to absolute `score_com::…` paths) compiles unchanged:
+
+```python
+rust_test(
+    name = "my-module-tests",
+    crate = ":my_module",
+    deps = [
+        "//score/mw/com/rust:score_com_fake",   # instead of :score_com
+        "@score_communication_crate_index//:futures",
+        "@score_communication_crate_index//:tokio",   # only if you use async discovery
+    ],
+)
+```
+
+`//score/mw/com/rust:score_com_fake` is marked `testonly = True`, so the fake can only be pulled into test targets — production code can never link it by accident.
+
+### The public API
+
+The entry point is **`FakeRuntimeImpl`**. Everything you create from it shares one **`FakeRegistry`** (an `Arc`-backed in-memory pub/sub map), so a producer and a consumer created through *different clones* of the runtime still exchange data. The fake exposes the same associated types the concepts require, so business code stays runtime-agnostic:
+
+| Public type | Implements | What it does |
+|---|---|---|
+| `FakeRuntimeImpl` | `Runtime` | Entry point. `new()`, `with_registry(registry)` (share a registry across runtimes), `registry()`. `find_service` / `producer_builder` hand out the types below. |
+| `FakeRegistry` | — | The shared in-memory state: the offered instances of each interface plus one `EventQueue<T>` per `(instance, event)`. `new()`. Cloning shares the same registry. |
+| `FakeProviderInfo` | `ProviderInfo` | Producer-side handle. `offer_service()` marks the instance offered (and wakes waiting discovery); `stop_offer_service()` withdraws it. |
+| `FakeConsumerInfo` | `ConsumerInfo` | Consumer-side handle. Carries the registry and the `(interface, instance)` coordinates; `interface!` clones it once per event. |
+| `FakeProducerBuilder<I>` | `ProducerBuilder<I>` | From `producer_builder::<I>(spec)`. `build()` constructs the generated producer. |
+| `FakeConsumerBuilder<I>` | `ConsumerBuilder<I>` | Returned by discovery. `build()` constructs the `interface!`-generated consumer. |
+| `FakeConsumerDiscovery<I>` | `ServiceDiscovery<I>` | From `find_service::<I>(…)`. `get_available_instances()` reports the currently offered instances; `get_available_instances_async()` polls until one is offered (so a consumer created *before* the producer offers still discovers it). |
+| `FakePublisher<T>` | `Publisher<T>` | `send(value)` and `allocate()` deliver the value into the shared `EventQueue<T>` for the event. |
+| `FakeSubscriber<T>` | `Subscriber<T>` | `subscribe(max_samples)` returns a `FakeSubscription<T>`. |
+| `FakeSubscription<T>` | `Subscription<T>` | `try_receive`, `to_stream`, `cancellable_receive` pull the samples that have been delivered to the event's queue. |
+| `FakeSample<T>` | `Sample<T>` | The received value handed to you (it owns the `T` and derefs to it). |
+| `FakeSampleMut<'a, T>` / `FakeSampleMaybeUninit<'a, T>` | `SampleMut<T>` / `SampleMaybeUninit<T>` | The send-side buffers from `Publisher::allocate`; `write(…)`/`assume_init(…)` then `send()` push the value to the queue. |
+| `EventQueue<T>` | — | The per-event queue shared by the publisher and every subscription (the unit of data delivery). |
+
+The two info handles (`FakeProviderInfo`, `FakeConsumerInfo`) are what the `interface!` macro hands to the generated `Producer`/`Consumer` constructors, so a test never has to construct a publisher or subscriber by hand — it just drives the normal API.
+
+### A small example
+
+This test runs a minimal producer→consumer round trip against the generated `Vehicle` interface and asserts the tire that was sent is the one that arrives. Note there is **no scripting and no expectations** — the value really travels through the in-memory registry. It uses only the synchronous API, so it is a plain `#[test]`. (The mirrored, async version lives in [`tests_using_fake_runtime.rs`](../example/com-api-example/tests_using_fake_runtime.rs).)
+
+```rust
+use score_com::{
+    Builder, FindServiceSpecifier, FakeRuntimeImpl, InstanceSpecifier, Producer, Publisher,
+    Runtime, SampleContainer, SampleMaybeUninit, SampleMut, ServiceDiscovery, Subscription,
+    Subscriber,
+};
+use com_api_gen::{Tire, VehicleInterface};
+
+#[test]
+fn round_trip_delivers_real_samples() {
+    // One runtime instance is enough: the producer and the consumer created
+    // from it share the same registry.
+    let runtime = FakeRuntimeImpl::new();
+    let spec = InstanceSpecifier::new("/Vehicle/Service1/Instance").unwrap();
+
+    // Producer side: build, offer, publish.
+    let offered = runtime
+        .producer_builder::<VehicleInterface>(spec.clone())
+        .build().unwrap()
+        .offer().unwrap();
+    offered.left_tire
+        .allocate().unwrap()
+        .write(Tire { pressure: 42.0 })
+        .send().unwrap();
+
+    // Consumer side: discover, build, subscribe, read.
+    let consumer = runtime
+        .find_service::<VehicleInterface>(FindServiceSpecifier::Specific(spec.clone()))
+        .get_available_instances().unwrap()
+        .into_iter().next().unwrap()
+        .build().unwrap();
+    let sub = consumer.left_tire.subscribe(5).unwrap();
+
+    let mut buffer = SampleContainer::new(5);
+    let added = sub.try_receive(&mut buffer, 5).unwrap();
+    assert_eq!(added, 1);
+    assert_eq!(buffer.iter::<Tire>().next().unwrap().pressure, 42.0);
+}
+```
+
+Reading it top to bottom, every line after `let runtime = …` is an ordinary COM API call, identical to what you would write against the production runtime. The assertion at the end checks that the value published on the producer side actually reached the subscription on the consumer side.
+
+### How delivery works
+
+Each `(instance, event)` owns one `EventQueue<T>`. `Publisher::send` appends the value **by value**; a subscription drains it. Samples are retained until a subscription consumes them, so a subscriber established *after* a sample was sent still receives it (in send order), and replacement semantics (`try_receive` keeps at most `max_samples`, dropping the oldest) match the contract of the production runtime. `to_stream` yields the delivered samples one at a time and parks while nothing is pending.
+
+### When to use which test runtime
+
+- **Fake runtime** — you want the *whole round trip* (produce → discover → receive) to actually move real data, to test wiring and business logic integration. No scripting.
+- **Mockall runtime** — you want to *isolate and assert* individual interactions (call counts, exact arguments, injected failures) on a per-component basis.
+
 ## Further Reading
 
 - [high_level_design_detail.md](design/high_level_design_detail.md) — internal architecture, layer details, trait reference, and module structure
