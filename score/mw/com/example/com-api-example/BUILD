@@ -78,3 +78,19 @@ rust_test(
         "@score_communication_crate_index//:tokio",
     ],
 )
+
+# Mirrors `com-api-example-tokio-integration-test` but runs against the
+# functional fake (Plan A) runtime. Nothing is scripted: published samples are
+# actually delivered to the consumer over the in-memory registry. No config
+# file or backend is needed, so it runs in normal CI (no `manual` tag).
+rust_test(
+    name = "com-api-example-fake-runtime-test",
+    srcs = ["tests_using_fake_runtime.rs"],
+    features = ["link_std_cpp_lib"],
+    deps = [
+        "//score/mw/com/example/com-api-example/com-api-gen",
+        "//score/mw/com/rust:score_com_fake",
+        "@score_communication_crate_index//:futures",
+        "@score_communication_crate_index//:tokio",
+    ],
+)

@@ -59,3 +59,20 @@ rust_library(
         "//score/mw/com/impl/rust/com-api/com-api-runtime-mockall",
     ],
 )
+
+# Test-only re-export of the full COM API including the functional fake (Plan A)
+# runtime. `crate_name` is mandatory: the interface! macro expands to absolute
+# `score_com::…` paths.
+rust_library(
+    name = "score_com_fake",
+    testonly = True,
+    srcs = ["score_com_fake.rs"],
+    crate_name = "score_com",
+    visibility = [
+        "//visibility:public",
+    ],
+    deps = [
+        ":score_com",
+        "//score/mw/com/impl/rust/com-api/com-api-runtime-fake",
+    ],
+)
